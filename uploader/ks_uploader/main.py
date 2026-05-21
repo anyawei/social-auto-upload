@@ -9,6 +9,7 @@ from pathlib import Path
 
 from patchright.async_api import Page
 from patchright.async_api import Playwright
+from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 from patchright.async_api import async_playwright
 
 from conf import DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
@@ -387,37 +388,378 @@ class KSVideo(KSBaseUploader):
 
     async def set_thumbnail(self, page: Page):
         if not self.thumbnail_path:
+            kuaishou_logger.info(
+                _msg("🤷", "没传 thumbnail_path,跳过封面设置;快手会用视频首帧")
+            )
             return
 
-        kuaishou_logger.info(_msg("🖼️", "小人准备设置封面"))
+        kuaishou_logger.info(
+            _msg("🖼️", f"小人准备设置封面 (路径: {self.thumbnail_path})")
+        )
+
+        # 点封面前先确保任何遮罩 / "我知道了" 引导已关掉,否则点击会被遮挡
+        try:
+            await self.close_guide_overlay(page)
+        except Exception:
+            pass
 
         cover_label = page.locator("span").filter(has_text="封面设置")
         await cover_label.wait_for(state="visible", timeout=30000)
+        # 点封面区前先 scroll 到可见,有的版本封面块在折叠区里。
+        try:
+            await cover_label.scroll_into_view_if_needed(timeout=3000)
+        except Exception:
+            pass
+
+        if self.debug:
+            try:
+                shot_path = (
+                    f"/tmp/sau_ks_before_cover_click_{int(asyncio.get_event_loop().time())}.png"
+                )
+                await page.screenshot(path=shot_path, full_page=True)
+                kuaishou_logger.info(_msg("📸", f"点封面前页面截图: {shot_path}"))
+            except Exception:
+                pass
+
         await cover_label.locator("xpath=../following-sibling::div[1]").locator('div').nth(0).click()
 
-        modal = page.locator('div[role="document"].ant-modal')
-        await modal.wait_for(state="visible", timeout=30000)
-
-        upload_cover_tab = modal.get_by_text("上传封面", exact=True)
-        await upload_cover_tab.wait_for(state="visible", timeout=10000)
-        await upload_cover_tab.click()
-
-        file_input = modal.locator('input[type="file"]')
-        await file_input.wait_for(state="attached", timeout=30000)
-        await file_input.set_input_files(self.thumbnail_path)
+        # 找封面 modal。ant-design 新老版本 DOM 结构差很多,这里多 selector 兜底,
+        # 谁先 visible 取谁。原版 `div[role="document"].ant-modal` 在新版 antd 里
+        # 失效(role="document" 已经从 ant-modal 上移除),会导致 30s timeout。
         await asyncio.sleep(1)
+        # `:visible` 伪类 already 表示 Playwright 认为可见。但后续 `wait_for(visible)`
+        # 在快手当前 UI 下会超时(动画/opacity/z-index 等),会把好端端的命中重置成 None。
+        # 改成:只要伪类 match 命中数 > 0,就锁定它,不再额外 wait_for(visible)。
+        #
+        # 关键:优先用 `.ant-modal-wrap`(包含整个 modal 含 footer 按钮),
+        # `.ant-modal-content` 只包含 header+body,可能不含 footer 的"确认"按钮 —
+        # 这就是为什么后面 modal scope 找"确认"全 0 命中的根因。
+        modal_selectors = [
+            '.ant-modal-wrap:visible',                          # 新版:整个 modal wrapper(含 footer)
+            '.ant-modal:visible',                               # 新版:next-level (一般也含 footer)
+            '.ant-modal-content:visible',                       # 老版:可能不含 footer
+            'div[role="dialog"].ant-modal:visible',
+            'div[role="document"].ant-modal:visible',
+        ]
+        modal = None
+        for sel in modal_selectors:
+            loc = page.locator(sel)
+            try:
+                cnt = await loc.count()
+            except Exception:
+                cnt = 0
+            kuaishou_logger.info(
+                _msg("🪟", f"selector {sel!r} 命中数: {cnt}")
+            )
+            if cnt:
+                modal = loc.last
+                kuaishou_logger.info(_msg("✅", f"封面 modal 锁定: {sel}"))
+                break
 
-        confirm_button = modal.get_by_role("button", name="确认", exact=True)
-        await confirm_button.wait_for(state="visible", timeout=10000)
-        await confirm_button.click()
+        if modal is None:
+            try:
+                shot_path = (
+                    f"/tmp/sau_ks_modal_never_opened_{int(asyncio.get_event_loop().time())}.png"
+                )
+                await page.screenshot(path=shot_path, full_page=True)
+                kuaishou_logger.error(
+                    _msg("📸", f"4 种 selector 都没抓到封面 modal,现场: {shot_path}")
+                )
+            except Exception:
+                pass
+            raise RuntimeError("找不到封面 modal — 全部 selector 失效")
 
-        await modal.wait_for(state="hidden", timeout=30000)
-        kuaishou_logger.success(_msg("🥳", "封面已经设置完成"))
+        if self.debug:
+            try:
+                shot_path = (
+                    f"/tmp/sau_ks_cover_modal_open_{int(asyncio.get_event_loop().time())}.png"
+                )
+                await page.screenshot(path=shot_path, full_page=True)
+                kuaishou_logger.info(_msg("📸", f"封面 modal 打开后截图: {shot_path}"))
+            except Exception:
+                pass
+
+        # 切到"上传封面"tab。
+        # 现状(2026-05 快手 UI):modal 默认在"封面截取"tab,需要主动切到"上传封面"
+        # 才能露出本地文件 input;"封面截取"和"上传封面"两个 tab 各自有自己的 input。
+        #
+        # tab 元素可能在 `.ant-modal-content` 外面(antd 的 modal 内部结构会变),
+        # 所以这里不绑 modal scope,直接 page scope 搜;也不用 exact 减少误判。
+        tab_switched = False
+        tab_strategies = [
+            ("page.text(上传封面)",    page.get_by_text("上传封面")),
+            ("page.text(本地上传)",    page.get_by_text("本地上传")),
+            ("page.text(上传图片)",    page.get_by_text("上传图片")),
+            ("page.role=tab(上传封面)", page.get_by_role("tab", name="上传封面")),
+            ("modal.text(上传封面)",   modal.get_by_text("上传封面")),
+        ]
+        for name, loc in tab_strategies:
+            try:
+                cnt = await loc.count()
+            except Exception:
+                cnt = 0
+            if not cnt:
+                continue
+            # 命中可能 > 1(同一段文字出现在不同祖先里),挨个尝试 click 直到一个成功
+            for i in range(min(cnt, 5)):
+                try:
+                    await loc.nth(i).click(timeout=3000)
+                    kuaishou_logger.info(
+                        _msg("🗂️", f"切到 tab: {name} (nth={i}, 总命中={cnt})")
+                    )
+                    tab_switched = True
+                    break
+                except Exception as e:
+                    kuaishou_logger.debug(
+                        f"tab click {name}[{i}] 失败: {e}"
+                    )
+                    continue
+            if tab_switched:
+                break
+
+        if not tab_switched:
+            try:
+                shot_path = (
+                    f"/tmp/sau_ks_tab_not_found_{int(asyncio.get_event_loop().time())}.png"
+                )
+                await page.screenshot(path=shot_path, full_page=True)
+                kuaishou_logger.error(
+                    _msg("📸", f"找不到上传封面 tab,现场: {shot_path}")
+                )
+            except Exception:
+                pass
+            raise RuntimeError(
+                "找不到「上传封面」tab — 不切 tab 会用错封面,这里直接 abort 别让脏数据发出去"
+            )
+        # 等"上传封面"面板渲染完
+        await asyncio.sleep(2.0)
+
+        # "上传封面" tab 不挂直接的 <input type=file>,而是一个"上传图片"按钮,
+        # 点击触发系统 file chooser。Playwright 必须用 expect_file_chooser()
+        # 接住,跟主流程上传视频用的模式一致(KSVideo.upload 顶部就是这么干的)。
+        upload_btn_strategies = [
+            ("page.text(上传图片)",     page.get_by_text("上传图片")),
+            ("page.role=button(上传图片)", page.get_by_role("button", name="上传图片")),
+            ("page.text(拖拽图片到此或点击上传)", page.get_by_text("拖拽图片到此或点击上传")),
+        ]
+        upload_btn = None
+        chosen_strategy = None
+        for name, loc in upload_btn_strategies:
+            try:
+                cnt = await loc.count()
+            except Exception:
+                cnt = 0
+            if cnt:
+                upload_btn = loc.last
+                chosen_strategy = name
+                kuaishou_logger.info(
+                    _msg("📦", f"上传按钮锁定: {name} (命中={cnt})")
+                )
+                break
+        if upload_btn is None:
+            try:
+                shot_path = (
+                    f"/tmp/sau_ks_cover_no_input_{int(asyncio.get_event_loop().time())}.png"
+                )
+                await page.screenshot(path=shot_path, full_page=True)
+                kuaishou_logger.error(_msg("📸", f"找不到上传按钮现场: {shot_path}"))
+            except Exception:
+                pass
+            raise RuntimeError(
+                "找不到「上传图片」按钮 — UI 可能又改了"
+            )
+
+        try:
+            async with page.expect_file_chooser(timeout=15000) as fc_info:
+                await upload_btn.click(timeout=5000)
+            file_chooser = await fc_info.value
+            await file_chooser.set_files(self.thumbnail_path)
+            kuaishou_logger.info(
+                _msg("🖼️", f"通过 file chooser 上传封面 (strategy: {chosen_strategy})")
+            )
+        except PlaywrightTimeoutError:
+            # 兜底:有的版本是 hidden input,点击按钮不触发系统选择器
+            # 此时还是有 input 挂在 DOM 上,只是 modal scope 没找到。换 page scope 找。
+            kuaishou_logger.warning(
+                _msg("⚠️", "file chooser 没弹出,fallback 到 page-scope input 查找")
+            )
+            file_input = page.locator(
+                'input[type="file"][accept*="image"]'
+            ).last
+            try:
+                await file_input.wait_for(state="attached", timeout=5000)
+            except PlaywrightTimeoutError:
+                file_input = page.locator('input[type="file"]').last
+                await file_input.wait_for(state="attached", timeout=5000)
+            await file_input.set_input_files(self.thumbnail_path)
+            kuaishou_logger.info(_msg("🖼️", "通过 hidden input set_files 上传封面"))
+
+        # 关键:等封面真的上传到 CDN 并渲染出预览,再点确认。
+        # 否则 modal 关掉了但 server 那边什么都没收到 = 发布出去没封面。
+        # 优先看 img preview 出现;退而求其次看"上传中"/loading 消失。
+        preview_ok = False
+        try:
+            preview = modal.locator(
+                'img[src^="http"], img[src^="data:"], img[src^="blob:"]'
+            ).first
+            await preview.wait_for(state="visible", timeout=20000)
+            preview_ok = True
+            kuaishou_logger.info(_msg("🧷", "封面预览图已渲染"))
+        except PlaywrightTimeoutError:
+            kuaishou_logger.warning(
+                _msg("⚠️", "封面预览图没等到,等 loading 消失再点确认")
+            )
+        if not preview_ok:
+            try:
+                loading = modal.locator(
+                    'text=/上传中|loading|加载中/'
+                ).first
+                if await loading.count():
+                    await loading.wait_for(state="hidden", timeout=20000)
+            except PlaywrightTimeoutError:
+                pass
+
+        # 给快手前端一点时间把"确认"按钮从 disabled 切到 enabled
+        await asyncio.sleep(1.5)
+
+        if self.debug:
+            try:
+                shot_path = (
+                    f"/tmp/sau_ks_cover_modal_{int(asyncio.get_event_loop().time())}.png"
+                )
+                await page.screenshot(path=shot_path, full_page=True)
+                kuaishou_logger.info(
+                    _msg("📸", f"封面 modal 截图: {shot_path} (确认前)")
+                )
+            except Exception:
+                pass
+
+        # 找封面 modal 的"确认"按钮。优先从 modal scope 找,排除主页其他"确认"
+        # 残留(比如发布栏的"确认发布")导致 .last 抓错隐藏元素。
+        confirm_strategies = [
+            ("modal.button:has-text(确认)",   modal.locator('button:has-text("确认")')),
+            ("modal.role=button(确认)",       modal.get_by_role("button", name="确认", exact=True)),
+            ("modal.text(确认)",              modal.get_by_text("确认", exact=True)),
+            ("page button:visible:has-text(确认)", page.locator('button:visible:has-text("确认")')),
+        ]
+        confirm_button = None
+        for name, loc in confirm_strategies:
+            try:
+                cnt = await loc.count()
+            except Exception:
+                cnt = 0
+            if cnt:
+                # modal scope 内通常只有 1 个"确认"(封面 modal 那个);
+                # 兜底 page-scope 也用 .first 选第一个可见的,避免误选隐藏残留。
+                confirm_button = loc.first
+                kuaishou_logger.info(
+                    _msg("🟢", f"确认按钮锁定: {name} (命中={cnt}, 取 first)")
+                )
+                break
+        if confirm_button is None:
+            try:
+                shot_path = (
+                    f"/tmp/sau_ks_cover_no_confirm_{int(asyncio.get_event_loop().time())}.png"
+                )
+                await page.screenshot(path=shot_path, full_page=True)
+                kuaishou_logger.error(_msg("📸", f"找不到确认按钮: {shot_path}"))
+            except Exception:
+                pass
+            raise RuntimeError("找不到封面 modal 的确认按钮")
+        # 等 disabled 切走
+        for _ in range(20):
+            try:
+                disabled = await confirm_button.get_attribute("disabled")
+                aria_disabled = await confirm_button.get_attribute("aria-disabled")
+            except Exception:
+                break
+            if disabled is None and aria_disabled not in ("true",):
+                break
+            await asyncio.sleep(0.5)
+
+        # 用 force=True 强 click,绕过 Playwright 可点性判断;只要元素存在就点。
+        # 之前 .last 选到隐藏元素的情况下会 timeout,这里强点能立刻给反馈。
+        await confirm_button.click(force=True)
+        kuaishou_logger.info(_msg("👆", "已 click 确认按钮 (force=True)"))
+
+        # 给前端一点时间响应 click(modal 关 + 主页刷新 thumbnail)
+        await asyncio.sleep(3)
+
+        if self.debug:
+            try:
+                shot_path = (
+                    f"/tmp/sau_ks_after_confirm_{int(asyncio.get_event_loop().time())}.png"
+                )
+                await page.screenshot(path=shot_path, full_page=True)
+                kuaishou_logger.info(_msg("📸", f"点确认后截图: {shot_path}"))
+            except Exception:
+                pass
+
+        # modal 是否真的关掉了 —— 是判断 click 有没有生效的最直接信号
+        try:
+            await modal.wait_for(state="hidden", timeout=15000)
+            kuaishou_logger.info(_msg("✅", "封面 modal 已关闭"))
+        except PlaywrightTimeoutError:
+            kuaishou_logger.error(
+                _msg(
+                    "😵",
+                    "click 后 15s modal 仍未关闭 — 上面那个'确认'按钮根本不是封面"
+                    "modal 的(可能选到了其它元素)。这次发布大概率没封面!"
+                )
+            )
+
+        # 主页缩略图 src 抓出来打印,人工判断是不是我们传的图。
+        # 注意:即使我们没设封面成功,快手也会用视频首帧自动生成 thumb,所以
+        # "有 img 元素"≠"封面是我们的"。看 src 才能确认。
+        try:
+            preview_on_page = page.locator(
+                'xpath=//*[contains(text(),"封面设置")]/ancestor::*[self::div][2]//img'
+            ).first
+            src = await preview_on_page.get_attribute("src", timeout=8000)
+            kuaishou_logger.info(_msg("🔍", f"主页缩略图 src: {src}"))
+            # 我们传的是 PNG,快手保存后 URL 应该包含 'png' 或来自用户上传 CDN
+            # (vs 视频首帧通常是 video tos 抽帧);这里只打印,不强判断
+            if src and ("png" in src.lower() or "kos-" in src or "ks-photo" in src):
+                kuaishou_logger.success(_msg("🥳", "封面看起来来自上传(包含 png/kos 标记)"))
+            else:
+                kuaishou_logger.warning(_msg(
+                    "⚠️",
+                    "封面 src 看起来不像我们传的图(可能是视频首帧抽出来的)。"
+                    "去快手账号肉眼确认"
+                ))
+        except PlaywrightTimeoutError:
+            kuaishou_logger.warning(_msg("⚠️", "主页缩略图 selector 没匹到"))
 
     async def upload(self, playwright: Playwright) -> None:
         kuaishou_logger.info(_msg("🧍", "小人先检查 cookie、视频文件、封面和发布时间"))
         await self.validate_upload_args()
         kuaishou_logger.info(_msg("🥳", "上传前检查通过"))
+
+        # 关键参数全 dump,出问题时排查不用猜
+        # (尤其是 thumbnail_path:None 还是路径,文件存不存在,体积多大)
+        thumb_info = "无(快手将自动用视频首帧)"
+        if self.thumbnail_path:
+            tp = Path(self.thumbnail_path)
+            if tp.exists():
+                thumb_info = f"{tp} ({tp.stat().st_size} bytes)"
+            else:
+                thumb_info = f"{tp} (⚠️ 文件不存在)"
+        kuaishou_logger.info(
+            _msg(
+                "📋",
+                "本次上传参数: "
+                f"title={self.title!r} | "
+                f"file={self.file_path} | "
+                f"thumbnail={thumb_info} | "
+                f"tags={self.tags} | "
+                f"desc={(self.desc or '')[:60]!r} | "
+                f"publish_strategy={self.publish_strategy!r} | "
+                f"publish_date={self.publish_date} | "
+                f"account_file={self.account_file} | "
+                f"headless={self.headless} | "
+                f"debug={self.debug}",
+            )
+        )
 
         if self.local_executable_path:
             browser = await playwright.chromium.launch(
