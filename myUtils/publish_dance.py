@@ -17,7 +17,7 @@
     uv run python myUtils/publish_dance.py \
         --video <成片.mp4> --dance "叮叮当当舞" \
         [--role 沥] [--style 赛博朋克] [--account 沄] \
-        [--platforms bilibili,douyin,kuaishou] [--tid 20] [--dry-run]
+        [--platforms bilibili,douyin,kuaishou] [--tid 20] [--schedule "2026-05-26 19:00"] [--dry-run]
 
 --dry-run:只生成封面 + 打印将执行的发布命令,不真正发布(先验封面/命令时用)。
 """
@@ -60,6 +60,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--account", default=DEFAULT_ACCOUNT)
     ap.add_argument("--platforms", default=",".join(DEFAULT_PLATFORMS))
     ap.add_argument("--tid", type=int, default=DEFAULT_TID, help="B站分区,默认 20(宅舞)")
+    ap.add_argument(
+        "--schedule",
+        default=None,
+        help='定时发布 "YYYY-MM-DD HH:MM"(走各平台原生定时:上传发生在现在,到点由平台放出,电脑可关;不传=立即发)',
+    )
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
 
@@ -74,7 +79,11 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"标题/简介: {title}")
     print(f"标签:      {tags}")
-    print(f"平台:      {', '.join(platforms)}  账号: {args.account}" + ("  [DRY-RUN]" if args.dry_run else ""))
+    print(
+        f"平台:      {', '.join(platforms)}  账号: {args.account}"
+        + (f"  定时: {args.schedule}(平台到点发)" if args.schedule else "  (立即发)")
+        + ("  [DRY-RUN]" if args.dry_run else "")
+    )
 
     print("\n① 生成封面(清晰度+正脸挑帧)...")
     cov = generate_covers(args.video)
@@ -85,6 +94,8 @@ def main(argv: list[str] | None = None) -> int:
     print("  抖音:       不传封面,自动用首帧")
 
     base = ["--account", args.account, "--file", str(args.video), "--title", title, "--desc", desc, "--tags", tags]
+    if args.schedule:
+        base += ["--schedule", args.schedule]  # 各平台 upload-video 都支持,走平台原生定时
     results: dict[str, str] = {}
     for p in platforms:
         print(f"\n② 发布 {p} ...")
