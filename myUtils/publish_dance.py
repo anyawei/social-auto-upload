@@ -5,7 +5,7 @@
 
 规则(2026-05,anyawei 约定):
 - 标题 = 简介 = "{角色名}，跳个{舞蹈名}"
-- 标签 = 角色名, 舞蹈名, 风格, AI少女
+- 标签 = 角色名, 舞蹈名, 风格, AI少女, 舞蹈挑战
 - 封面 = 自动调 cover_frames.generate_covers(清晰度+正脸评分挑帧):
     B站(横版) → cover_landscape.jpg(3帧横拼)
     快手(竖版) → cover_portrait.jpg(最佳正脸帧)
@@ -69,7 +69,7 @@ def main(argv: list[str] | None = None) -> int:
 
     title = f"{args.role}，跳个{args.dance}"
     desc = title
-    tags = ",".join([args.role, args.dance, args.style, "AI少女"])
+    tags = ",".join([args.role, args.dance, args.style, "AI少女", "舞蹈挑战"])
     platforms = [p.strip() for p in args.platforms.split(",") if p.strip()]
 
     print(f"标题/简介: {title}")
