@@ -131,6 +131,52 @@ def pick_frames(video: Path, count: int = 3, samples: int = 60) -> dict:
     }
 
 
+def generate_covers(video: Path, outdir: Path | None = None, count: int = 3, samples: int = 60) -> dict:
+    """挑帧并写出竖版/横版封面。返回 {portrait, landscape, frames, outdir, report}。
+
+    - portrait  = 最佳正脸帧(竖版封面,给快手/竖版平台)
+    - landscape = count 帧按时间横拼(横版封面,给 B站)
+    供发布编排(publish_dance.py)直接调用,封面这一步因此被写进发布流程,不靠记忆。
+    """
+    outdir = outdir or video.parent / f"covers_{video.stem}"
+    outdir.mkdir(parents=True, exist_ok=True)
+    res = pick_frames(video, count=count, samples=samples)
+    ordered = res["ordered"]
+
+    frames = []
+    for i, c in enumerate(ordered, 1):
+        p = outdir / f"frame_{i}.jpg"
+        cv2.imwrite(str(p), c["frame"], [cv2.IMWRITE_JPEG_QUALITY, 95])
+        frames.append(p)
+
+    portrait_path = outdir / "cover_portrait.jpg"
+    cv2.imwrite(str(portrait_path), res["portrait"]["frame"], [cv2.IMWRITE_JPEG_QUALITY, 95])
+    landscape_path = outdir / "cover_landscape.jpg"
+    cv2.imwrite(
+        str(landscape_path),
+        cv2.hconcat([c["frame"] for c in ordered]),
+        [cv2.IMWRITE_JPEG_QUALITY, 95],
+    )
+
+    lines = [
+        f"采样 {res['sampled']} 帧,检到正脸 {res['faced_count']} 帧"
+        + ("" if res["faced_count"] else " → 无脸,退化为挑最清晰帧")
+    ]
+    for i, c in enumerate(ordered, 1):
+        tag = " ★竖版" if c is res["portrait"] else ""
+        lines.append(
+            f"  frame_{i}: t={c['t']:.1f}s 清晰度={c['sharp']:.0f} "
+            f"脸={'有' if c['has_face'] else '无'} 分={c['score']:.2f}{tag}"
+        )
+    return {
+        "portrait": portrait_path,
+        "landscape": landscape_path,
+        "frames": frames,
+        "outdir": outdir,
+        "report": "\n".join(lines),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="从视频挑清晰正脸帧做竖版/横版封面")
     ap.add_argument("video", type=Path)
@@ -142,39 +188,10 @@ def main(argv: list[str] | None = None) -> int:
     if not args.video.exists():
         print(f"❌ 视频不存在: {args.video}", file=sys.stderr)
         return 1
-    outdir = args.outdir or args.video.parent / f"covers_{args.video.stem}"
-    outdir.mkdir(parents=True, exist_ok=True)
-
-    res = pick_frames(args.video, count=args.count, samples=args.samples)
-    ordered = res["ordered"]
-
-    # 写各帧
-    frame_paths = []
-    for i, c in enumerate(ordered, 1):
-        p = outdir / f"frame_{i}.jpg"
-        cv2.imwrite(str(p), c["frame"], [cv2.IMWRITE_JPEG_QUALITY, 95])
-        frame_paths.append(p)
-
-    # 竖版 = 最佳单帧
-    portrait_path = outdir / "cover_portrait.jpg"
-    cv2.imwrite(str(portrait_path), res["portrait"]["frame"], [cv2.IMWRITE_JPEG_QUALITY, 95])
-
-    # 横版 = N 帧横拼(同源等高,可直接 hconcat)
-    landscape_path = outdir / "cover_landscape.jpg"
-    cv2.imwrite(str(landscape_path), cv2.hconcat([c["frame"] for c in ordered]), [cv2.IMWRITE_JPEG_QUALITY, 95])
-
-    print(
-        f"采样 {res['sampled']} 帧,其中检到正脸 {res['faced_count']} 帧"
-        + ("" if res["faced_count"] else " → 无脸,退化为挑最清晰帧")
-    )
-    for i, c in enumerate(ordered, 1):
-        tag = " ★竖版" if c is res["portrait"] else ""
-        print(
-            f"  frame_{i}: t={c['t']:.1f}s 清晰度={c['sharp']:.0f} "
-            f"脸={'有' if c['has_face'] else '无'} 分={c['score']:.2f}{tag}"
-        )
-    print(f"竖版封面: {portrait_path}")
-    print(f"横版封面: {landscape_path}")
+    r = generate_covers(args.video, args.outdir, args.count, args.samples)
+    print(r["report"])
+    print(f"竖版封面: {r['portrait']}")
+    print(f"横版封面: {r['landscape']}")
     return 0
 
 
