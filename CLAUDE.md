@@ -32,6 +32,13 @@ The project also provides a command-line interface (CLI) for users who prefer to
 *   `login`: To log in to the Douyin uploader account.
 *   `check`: To verify whether the saved Douyin cookie is still valid.
 *   `upload`: To upload one video file with explicit metadata flags.
+*   `stats`: Cross-platform — pull play/like/comment counts for published works (`sau stats --account <name> [--title <kw>] [--json]`). Reads official JSON APIs only (no DOM scraping): Douyin `work_list` (forced **headed** — headless returns an empty list), Kuaishou `photo/list`, Bilibili `member archives`. Implemented in `myUtils/stats.py`.
+
+**一键发片(舞蹈成片)**:`uv run python myUtils/publish_dance.py --video <mp4> --dance "<舞蹈名>" [--role 沥] [--style 赛博朋克] [--dry-run]`。把"封面生成 + 标题/简介/标签"固化进发布流程,不靠记忆:
+*   标题=简介=`{角色名}，跳个{舞蹈名}`;标签=`角色名,舞蹈名,风格,AI少女`。
+*   封面由 `myUtils/cover_frames.py`(清晰度+正脸评分挑帧)自动生成:B站用横版(3帧横拼 `cover_landscape.jpg`),快手用竖版(最佳正脸帧 `cover_portrait.jpg`),抖音不传封面(自动首帧;传自定义图会报错)。
+*   默认发 bilibili,douyin,kuaishou(账号「沄」);抖音强制 `--headed`;B站默认分区 tid=20(宅舞)。
+*   `cover_frames.py` 也可单独跑只出封面:`uv run python myUtils/cover_frames.py <mp4>`。
 
 ## Building and Running
 

@@ -5,11 +5,11 @@
 
 规则(2026-05,anyawei 约定):
 - 标题 = 简介 = "{角色名}，跳个{舞蹈名}"
-- 标签 = 角色名, 舞蹈名, 风格, AI少女, 舞蹈挑战
+- 标签 = 角色名, 舞蹈名, 风格, AI少女, 舞蹈挑战, 抖音潮流舞蹈大赛
 - 封面 = 自动调 cover_frames.generate_covers(清晰度+正脸评分挑帧):
     B站(横版) → cover_landscape.jpg(3帧横拼)
     快手(竖版) → cover_portrait.jpg(最佳正脸帧)
-    抖音        → 不传封面(自动用首帧;传自定义图会触发封面 modal 报错)
+    抖音        → cover_portrait.jpg(同快手竖版;走 PC 封面 modal,失败则自动回退首帧)
 - 平台命令统一走 sau_cli(同 CLI 契约);抖音强制 --headed(headless 必超时失败)。
 - 账号默认「沄」,B站分区默认宅舞(tid=20)。
 
@@ -65,6 +65,18 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help='定时发布 "YYYY-MM-DD HH:MM"(走各平台原生定时:上传发生在现在,到点由平台放出,电脑可关;不传=立即发)',
     )
+    ap.add_argument(
+        "--cover-portrait",
+        type=Path,
+        default=None,
+        help="手动指定竖版封面(快手+抖音竖封面用);不传则自动挑帧。自动挑的不清晰/不满意时用。",
+    )
+    ap.add_argument(
+        "--cover-landscape",
+        type=Path,
+        default=None,
+        help="手动指定横版封面(B站+抖音横封面用);不传则自动挑帧。",
+    )
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
 
@@ -74,7 +86,7 @@ def main(argv: list[str] | None = None) -> int:
 
     title = f"{args.role}，跳个{args.dance}"
     desc = title
-    tags = ",".join([args.role, args.dance, args.style, "AI少女", "舞蹈挑战"])
+    tags = ",".join([args.role, args.dance, args.style, "AI少女", "舞蹈挑战", "抖音潮流舞蹈大赛"])
     platforms = [p.strip() for p in args.platforms.split(",") if p.strip()]
 
     print(f"标题/简介: {title}")
@@ -89,9 +101,21 @@ def main(argv: list[str] | None = None) -> int:
     cov = generate_covers(args.video)
     print(cov["report"])
     portrait, landscape = str(cov["portrait"]), str(cov["landscape"])
-    print(f"  竖版(快手): {portrait}")
-    print(f"  横版(B站):  {landscape}")
-    print("  抖音:       不传封面,自动用首帧")
+    # 手动指定的封面优先(自动挑帧可能误选雾蒙蒙/逆光帧 → Laplacian 虚高)
+    if args.cover_portrait:
+        if not args.cover_portrait.exists():
+            print(f"❌ 指定的竖版封面不存在: {args.cover_portrait}", file=sys.stderr)
+            return 1
+        portrait = str(args.cover_portrait)
+        print(f"  竖版: 用手动指定 {portrait}")
+    if args.cover_landscape:
+        if not args.cover_landscape.exists():
+            print(f"❌ 指定的横版封面不存在: {args.cover_landscape}", file=sys.stderr)
+            return 1
+        landscape = str(args.cover_landscape)
+        print(f"  横版: 用手动指定 {landscape}")
+    print(f"  竖版(快手+抖音竖): {portrait}")
+    print(f"  横版(B站+抖音横):  {landscape}")
 
     base = ["--account", args.account, "--file", str(args.video), "--title", title, "--desc", desc, "--tags", tags]
     if args.schedule:
@@ -106,7 +130,20 @@ def main(argv: list[str] | None = None) -> int:
         elif p == "kuaishou":
             rc = _run_sau(["kuaishou", "upload-video", *base, "--thumbnail", portrait], args.dry_run)
         elif p == "douyin":
-            rc = _run_sau(["douyin", "upload-video", *base, "--headed"], args.dry_run)  # 不传封面
+            # 竖封面同快手 + 横封面同 B站;走 PC 封面 modal(点上传按钮→file_chooser),失败则静默回退首帧
+            rc = _run_sau(
+                [
+                    "douyin",
+                    "upload-video",
+                    *base,
+                    "--thumbnail",
+                    portrait,
+                    "--thumbnail-landscape",
+                    landscape,
+                    "--headed",
+                ],
+                args.dry_run,
+            )
         else:
             print(f"  ⚠️ 跳过未知平台: {p}")
             continue

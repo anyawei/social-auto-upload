@@ -2,37 +2,45 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
-from dataclasses import dataclass
+from collections.abc import Iterable, Sequence
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Sequence
 
 from conf import BASE_DIR
+from myUtils.stats import SUPPORTED_PLATFORMS, StatItem, fetch_platform, render_table
 from uploader.bilibili_uploader.runtime import run_biliup_command
 from uploader.douyin_uploader.main import (
     DOUYIN_PUBLISH_STRATEGY_IMMEDIATE,
     DOUYIN_PUBLISH_STRATEGY_SCHEDULED,
     DouYinNote,
     DouYinVideo,
-    cookie_auth as douyin_cookie_auth,
     douyin_setup,
+)
+from uploader.douyin_uploader.main import (
+    cookie_auth as douyin_cookie_auth,
 )
 from uploader.ks_uploader.main import (
     KUAISHOU_PUBLISH_STRATEGY_IMMEDIATE,
     KUAISHOU_PUBLISH_STRATEGY_SCHEDULED,
     KSNote,
     KSVideo,
-    cookie_auth as kuaishou_cookie_auth,
     ks_setup,
+)
+from uploader.ks_uploader.main import (
+    cookie_auth as kuaishou_cookie_auth,
 )
 from uploader.xiaohongshu_uploader.main import (
     XIAOHONGSHU_PUBLISH_STRATEGY_IMMEDIATE,
     XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED,
     XiaoHongShuNote,
     XiaoHongShuVideo,
-    cookie_auth as xiaohongshu_cookie_auth,
     xiaohongshu_setup,
+)
+from uploader.xiaohongshu_uploader.main import (
+    cookie_auth as xiaohongshu_cookie_auth,
 )
 
 SCHEDULE_FORMAT = "%Y-%m-%d %H:%M"
@@ -47,6 +55,7 @@ class DouyinVideoUploadRequest:
     tags: list[str]
     publish_date: datetime | int
     thumbnail_file: Path | None = None
+    thumbnail_landscape_file: Path | None = None
     product_link: str = ""
     product_title: str = ""
     publish_strategy: str = DOUYIN_PUBLISH_STRATEGY_IMMEDIATE
@@ -222,7 +231,9 @@ async def login_bilibili_account(account_name: str) -> dict:
     success = result.returncode == 0
     return {
         "success": success,
-        "message": (result.stderr or result.stdout or "").strip() or "Bilibili login completed" if success else (result.stderr or result.stdout or "").strip() or "Bilibili login failed",
+        "message": (result.stderr or result.stdout or "").strip() or "Bilibili login completed"
+        if success
+        else (result.stderr or result.stdout or "").strip() or "Bilibili login failed",
         "account_file": str(account_file),
     }
 
@@ -251,6 +262,7 @@ async def upload_video(request: DouyinVideoUploadRequest) -> Path:
         str(account_file),
         desc=request.description,
         thumbnail_portrait_path=str(request.thumbnail_file) if request.thumbnail_file else None,
+        thumbnail_landscape_path=str(request.thumbnail_landscape_file) if request.thumbnail_landscape_file else None,
         productLink=request.product_link,
         productTitle=request.product_title,
         publish_strategy=request.publish_strategy,
@@ -422,9 +434,7 @@ def schedule_value(value: str):
     try:
         return parse_schedule(value)
     except ValueError as exc:
-        raise argparse.ArgumentTypeError(
-            f"Invalid schedule '{value}'. Expected format: {SCHEDULE_FORMAT}"
-        ) from exc
+        raise argparse.ArgumentTypeError(f"Invalid schedule '{value}'. Expected format: {SCHEDULE_FORMAT}") from exc
 
 
 def add_runtime_flags(parser: argparse.ArgumentParser) -> None:
@@ -459,14 +469,21 @@ def build_parser() -> argparse.ArgumentParser:
     upload_video_parser.add_argument("--desc", default="", help="Optional video description")
     upload_video_parser.add_argument("--tags", default="", help="Comma-separated tags, such as tag1,tag2")
     upload_video_parser.add_argument("--schedule", type=schedule_value, help=f"Schedule time in {schedule_help}")
-    upload_video_parser.add_argument("--thumbnail", type=existing_file_path, help="Optional thumbnail path")
+    upload_video_parser.add_argument(
+        "--thumbnail", type=existing_file_path, help="Optional thumbnail path (竖版封面 3:4)"
+    )
+    upload_video_parser.add_argument(
+        "--thumbnail-landscape", type=existing_file_path, help="Optional landscape thumbnail (横版封面 4:3)"
+    )
     upload_video_parser.add_argument("--product-link", default="", help="Optional product link")
     upload_video_parser.add_argument("--product-title", default="", help="Optional product title")
     add_runtime_flags(upload_video_parser)
 
     upload_note_parser = douyin_actions.add_parser("upload-note", help="Upload one note to Douyin")
     upload_note_parser.add_argument("--account", required=True, help="Douyin user-defined account_name")
-    upload_note_parser.add_argument("--images", required=True, nargs="+", type=existing_file_path, help="Image file paths")
+    upload_note_parser.add_argument(
+        "--images", required=True, nargs="+", type=existing_file_path, help="Image file paths"
+    )
     upload_note_parser.add_argument("--title", required=True, help="Note title")
     upload_note_parser.add_argument("--note", default="", help="Optional note content")
     upload_note_parser.add_argument("--tags", default="", help="Comma-separated tags, such as tag1,tag2")
@@ -488,17 +505,23 @@ def build_parser() -> argparse.ArgumentParser:
     kuaishou_upload_video_parser.add_argument("--title", required=True, help="Video title")
     kuaishou_upload_video_parser.add_argument("--desc", default="", help="Optional video description")
     kuaishou_upload_video_parser.add_argument("--tags", default="", help="Comma-separated tags, such as tag1,tag2")
-    kuaishou_upload_video_parser.add_argument("--schedule", type=schedule_value, help=f"Schedule time in {schedule_help}")
+    kuaishou_upload_video_parser.add_argument(
+        "--schedule", type=schedule_value, help=f"Schedule time in {schedule_help}"
+    )
     kuaishou_upload_video_parser.add_argument("--thumbnail", type=existing_file_path, help="Optional thumbnail path")
     add_runtime_flags(kuaishou_upload_video_parser)
 
     kuaishou_upload_note_parser = kuaishou_actions.add_parser("upload-note", help="Upload one note to Kuaishou")
     kuaishou_upload_note_parser.add_argument("--account", required=True, help="Kuaishou user-defined account_name")
-    kuaishou_upload_note_parser.add_argument("--images", required=True, nargs="+", type=existing_file_path, help="Image file paths")
+    kuaishou_upload_note_parser.add_argument(
+        "--images", required=True, nargs="+", type=existing_file_path, help="Image file paths"
+    )
     kuaishou_upload_note_parser.add_argument("--title", required=True, help="Note title")
     kuaishou_upload_note_parser.add_argument("--note", default="", help="Optional note content")
     kuaishou_upload_note_parser.add_argument("--tags", default="", help="Comma-separated tags, such as tag1,tag2")
-    kuaishou_upload_note_parser.add_argument("--schedule", type=schedule_value, help=f"Schedule time in {schedule_help}")
+    kuaishou_upload_note_parser.add_argument(
+        "--schedule", type=schedule_value, help=f"Schedule time in {schedule_help}"
+    )
     add_runtime_flags(kuaishou_upload_note_parser)
 
     xiaohongshu_parser = platform_parsers.add_parser("xiaohongshu", help="Xiaohongshu operations")
@@ -510,23 +533,39 @@ def build_parser() -> argparse.ArgumentParser:
         if action_name == "login":
             add_runtime_flags(action_parser)
 
-    xiaohongshu_upload_video_parser = xiaohongshu_actions.add_parser("upload-video", help="Upload one video to Xiaohongshu")
-    xiaohongshu_upload_video_parser.add_argument("--account", required=True, help="Xiaohongshu user-defined account_name")
-    xiaohongshu_upload_video_parser.add_argument("--file", required=True, type=existing_file_path, help="Video file path")
+    xiaohongshu_upload_video_parser = xiaohongshu_actions.add_parser(
+        "upload-video", help="Upload one video to Xiaohongshu"
+    )
+    xiaohongshu_upload_video_parser.add_argument(
+        "--account", required=True, help="Xiaohongshu user-defined account_name"
+    )
+    xiaohongshu_upload_video_parser.add_argument(
+        "--file", required=True, type=existing_file_path, help="Video file path"
+    )
     xiaohongshu_upload_video_parser.add_argument("--title", required=True, help="Video title")
     xiaohongshu_upload_video_parser.add_argument("--desc", default="", help="Optional video description")
     xiaohongshu_upload_video_parser.add_argument("--tags", default="", help="Comma-separated tags, such as tag1,tag2")
-    xiaohongshu_upload_video_parser.add_argument("--schedule", type=schedule_value, help=f"Schedule time in {schedule_help}")
+    xiaohongshu_upload_video_parser.add_argument(
+        "--schedule", type=schedule_value, help=f"Schedule time in {schedule_help}"
+    )
     xiaohongshu_upload_video_parser.add_argument("--thumbnail", type=existing_file_path, help="Optional thumbnail path")
     add_runtime_flags(xiaohongshu_upload_video_parser)
 
-    xiaohongshu_upload_note_parser = xiaohongshu_actions.add_parser("upload-note", help="Upload one note to Xiaohongshu")
-    xiaohongshu_upload_note_parser.add_argument("--account", required=True, help="Xiaohongshu user-defined account_name")
-    xiaohongshu_upload_note_parser.add_argument("--images", required=True, nargs="+", type=existing_file_path, help="Image file paths")
+    xiaohongshu_upload_note_parser = xiaohongshu_actions.add_parser(
+        "upload-note", help="Upload one note to Xiaohongshu"
+    )
+    xiaohongshu_upload_note_parser.add_argument(
+        "--account", required=True, help="Xiaohongshu user-defined account_name"
+    )
+    xiaohongshu_upload_note_parser.add_argument(
+        "--images", required=True, nargs="+", type=existing_file_path, help="Image file paths"
+    )
     xiaohongshu_upload_note_parser.add_argument("--title", required=True, help="Note title")
     xiaohongshu_upload_note_parser.add_argument("--note", default="", help="Optional note content")
     xiaohongshu_upload_note_parser.add_argument("--tags", default="", help="Comma-separated tags, such as tag1,tag2")
-    xiaohongshu_upload_note_parser.add_argument("--schedule", type=schedule_value, help=f"Schedule time in {schedule_help}")
+    xiaohongshu_upload_note_parser.add_argument(
+        "--schedule", type=schedule_value, help=f"Schedule time in {schedule_help}"
+    )
     add_runtime_flags(xiaohongshu_upload_note_parser)
 
     bilibili_parser = platform_parsers.add_parser("bilibili", help="Bilibili operations")
@@ -543,12 +582,56 @@ def build_parser() -> argparse.ArgumentParser:
     bilibili_upload_video_parser.add_argument("--desc", required=True, help="Video description")
     bilibili_upload_video_parser.add_argument("--tid", required=True, type=int, help="Bilibili category id")
     bilibili_upload_video_parser.add_argument("--tags", default="", help="Comma-separated tags, such as tag1,tag2")
-    bilibili_upload_video_parser.add_argument("--thumbnail", type=existing_file_path, help="Optional thumbnail/cover path")
-    bilibili_upload_video_parser.add_argument("--schedule", type=schedule_value, help=f"Schedule time in {schedule_help}")
+    bilibili_upload_video_parser.add_argument(
+        "--thumbnail", type=existing_file_path, help="Optional thumbnail/cover path"
+    )
+    bilibili_upload_video_parser.add_argument(
+        "--schedule", type=schedule_value, help=f"Schedule time in {schedule_help}"
+    )
+
+    stats_parser = platform_parsers.add_parser("stats", help="拉取作品播放/点赞等数据(跨平台)")
+    stats_parser.add_argument("--account", required=True, help="账号名(各平台 cookie 同名,如 沄)")
+    stats_parser.add_argument(
+        "--platforms",
+        default=",".join(SUPPORTED_PLATFORMS),
+        help=f"逗号分隔,默认 {','.join(SUPPORTED_PLATFORMS)}",
+    )
+    stats_parser.add_argument("--limit", type=int, default=30, help="每平台最多拉取作品数")
+    stats_parser.add_argument("--title", default="", help="仅显示标题包含该关键字的作品")
+    stats_parser.add_argument("--json", dest="as_json", action="store_true", help="输出 JSON 而非表格")
     return parser
 
 
+async def run_stats(args: argparse.Namespace) -> int:
+    """跨平台拉取作品数据并打印表格(或 JSON)。抖音自动走 headed(headless 拿不到列表)。"""
+    platforms = [p.strip() for p in args.platforms.split(",") if p.strip()]
+    unknown = [p for p in platforms if p not in SUPPORTED_PLATFORMS]
+    if unknown:
+        raise RuntimeError(f"不支持的平台: {', '.join(unknown)}。支持 {', '.join(SUPPORTED_PLATFORMS)}")
+    keyword = args.title or None
+    collected: list[StatItem] = []
+    for platform in platforms:
+        account_file = resolve_account_file(platform, args.account)
+        if not account_file.exists():
+            print(f"[skip] {platform}: cookie 不存在 {account_file}", file=sys.stderr)
+            continue
+        try:
+            items = await fetch_platform(platform, account_file, limit=args.limit)
+        except Exception as exc:  # noqa: BLE001 - 单平台失败不应中断其余平台
+            print(f"[error] {platform}: {exc}", file=sys.stderr)
+            continue
+        collected.extend(item for item in items if item.matches(keyword))
+    if args.as_json:
+        print(json.dumps([asdict(item) for item in collected], ensure_ascii=False, indent=2))
+    else:
+        print(render_table(collected) if collected else "(无匹配作品)")
+    return 0
+
+
 async def dispatch(args: argparse.Namespace) -> int:
+    if args.platform == "stats":
+        return await run_stats(args)
+
     if args.platform == "douyin":
         if args.action == "login":
             result = await login_douyin_account(args.account, headless=args.headless)
@@ -573,6 +656,7 @@ async def dispatch(args: argparse.Namespace) -> int:
                 tags=parse_tags(args.tags),
                 publish_date=args.schedule or 0,
                 thumbnail_file=args.thumbnail,
+                thumbnail_landscape_file=args.thumbnail_landscape,
                 product_link=args.product_link,
                 product_title=args.product_title,
                 publish_strategy=publish_strategy,

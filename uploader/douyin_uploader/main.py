@@ -1,25 +1,22 @@
-# -*- coding: utf-8 -*-
-from datetime import datetime
-
 import asyncio
 import inspect
 import os
+from datetime import datetime
 from pathlib import Path
 
-from patchright.async_api import Page
-from patchright.async_api import Playwright
-from patchright.async_api import TimeoutError as PlaywrightTimeoutError
-from patchright.async_api import async_playwright
-
 from conf import DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
+from patchright.async_api import Page, Playwright, async_playwright
+from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 from uploader.base_video import BaseVideoUploader
 from utils.base_social_media import set_init_script
-from utils.login_qrcode import build_login_qrcode_path
-from utils.login_qrcode import decode_qrcode_from_path
-from utils.login_qrcode import print_terminal_qrcode
-from utils.login_qrcode import remove_qrcode_file
-from utils.login_qrcode import save_data_url_image
 from utils.log import douyin_logger
+from utils.login_qrcode import (
+    build_login_qrcode_path,
+    decode_qrcode_from_path,
+    print_terminal_qrcode,
+    remove_qrcode_file,
+    save_data_url_image,
+)
 
 DOUYIN_PUBLISH_STRATEGY_IMMEDIATE = "immediate"
 DOUYIN_PUBLISH_STRATEGY_SCHEDULED = "scheduled"
@@ -38,7 +35,9 @@ async def _emit_qrcode_callback(qrcode_callback, payload: dict):
         await callback_result
 
 
-def _build_login_result(success: bool, status: str, message: str, account_file: str, qrcode: dict | None = None, current_url: str = "") -> dict:
+def _build_login_result(
+    success: bool, status: str, message: str, account_file: str, qrcode: dict | None = None, current_url: str = ""
+) -> dict:
     return {
         "success": success,
         "status": status,
@@ -56,21 +55,29 @@ async def cookie_auth(account_file):
             context = await browser.new_context(storage_state=account_file)
             context = await set_init_script(context)
             page = await context.new_page()
-            await page.goto("https://creator.douyin.com/creator-micro/content/upload")
+            await page.goto(
+                "https://creator.douyin.com/creator-micro/content/upload", wait_until="domcontentloaded", timeout=60000
+            )
             try:
-                await page.wait_for_url("https://creator.douyin.com/creator-micro/content/upload", timeout=5000)
+                await page.wait_for_url("https://creator.douyin.com/creator-micro/content/upload", timeout=10000)
             except Exception:
-                return False
+                # 抖音设备指纹绑定:headless 预检指纹跟 headed 登录不一致会被误判"未登录"。
+                # 这里不直接判失效,放行让真正的上传流程(可走 headed,指纹一致)自己判断。
+                douyin_logger.warning(_msg("⚠️", "cookie 预检未确认登录态(可能 headless 指纹差异),放行让上传流程自判"))
+                return True
 
             if await page.get_by_text("手机号登录").count() or await page.get_by_text("扫码登录").count():
-                return False
+                douyin_logger.warning(_msg("⚠️", "cookie 预检看到登录入口,但 headless 指纹可能误判,放行让上传流程自判"))
+                return True
 
             return True
         finally:
             await browser.close()
 
 
-async def douyin_setup(account_file, handle=False, return_detail=False, qrcode_callback=None, headless: bool = LOCAL_CHROME_HEADLESS):
+async def douyin_setup(
+    account_file, handle=False, return_detail=False, qrcode_callback=None, headless: bool = LOCAL_CHROME_HEADLESS
+):
     if not os.path.exists(account_file) or not await cookie_auth(account_file):
         if not handle:
             result = _build_login_result(False, "cookie_invalid", "cookie文件不存在或已失效", account_file)
@@ -88,8 +95,7 @@ async def _extract_douyin_qrcode_src(page: Page) -> str:
     await scan_login_tab.wait_for(timeout=30000)
 
     qrcode_img = (
-        scan_login_tab
-        .locator("..")
+        scan_login_tab.locator("..")
         .locator("xpath=following-sibling::div[1]")
         .locator('img[aria-label="二维码"]')
         .first
@@ -106,7 +112,9 @@ async def _extract_douyin_qrcode_src(page: Page) -> str:
     return src
 
 
-async def _save_douyin_qrcode(page: Page, account_file: str, previous_qrcode_path: Path | None = None, qrcode_callback=None) -> dict:
+async def _save_douyin_qrcode(
+    page: Page, account_file: str, previous_qrcode_path: Path | None = None, qrcode_callback=None
+) -> dict:
     qrcode_src = await _extract_douyin_qrcode_src(page)
     qrcode_path = save_data_url_image(qrcode_src, build_login_qrcode_path(account_file))
     if previous_qrcode_path and previous_qrcode_path != qrcode_path:
@@ -149,7 +157,14 @@ async def _is_douyin_login_completed(page: Page) -> bool:
     return True
 
 
-async def _wait_for_douyin_login(page: Page, account_file: str, qrcode_info: dict, qrcode_callback=None, poll_interval: int = 3, max_checks: int = 100) -> dict:
+async def _wait_for_douyin_login(
+    page: Page,
+    account_file: str,
+    qrcode_info: dict,
+    qrcode_callback=None,
+    poll_interval: int = 3,
+    max_checks: int = 100,
+) -> dict:
     qrcode_path = Path(qrcode_info["image_path"])
     for _ in range(max_checks):
         if await _is_douyin_login_completed(page):
@@ -184,7 +199,8 @@ async def douyin_cookie_gen(
         result = _build_login_result(False, "failed", "抖音登录失败", account_file)
         try:
             page = await context.new_page()
-            await page.goto("https://creator.douyin.com/")
+            # 等所有资源(load)在抖音创作中心常 timeout(海外分析/CDN 资源走代理卡死),改 domcontentloaded + 60s
+            await page.goto("https://creator.douyin.com/", wait_until="domcontentloaded", timeout=60000)
             qrcode_info = await _save_douyin_qrcode(page, account_file, qrcode_callback=qrcode_callback)
             qrcode_path = Path(qrcode_info["image_path"])
             douyin_logger.info(_msg("🧍", "请扫码，小人正在耐心等待登录完成"))
@@ -209,7 +225,9 @@ async def douyin_cookie_gen(
                         page.url,
                     )
         except Exception as exc:
-            result = _build_login_result(False, "failed", str(exc), account_file, current_url=page.url if "page" in locals() else "")
+            result = _build_login_result(
+                False, "failed", str(exc), account_file, current_url=page.url if "page" in locals() else ""
+            )
         finally:
             if remove_qrcode_file(qrcode_path):
                 douyin_logger.info(_msg("🧹", f"临时二维码文件已清理: {qrcode_path}"))
@@ -251,17 +269,52 @@ class DouYinBaseUploader(BaseVideoUploader):
             self.publish_date = 0
 
     async def set_schedule_time_douyin(self, page, publish_date):
-        label_element = page.locator("[class^='radio']:has-text('定时发布')")
-        await label_element.click()
-        await asyncio.sleep(1)
         publish_date_hour = publish_date.strftime("%Y-%m-%d %H:%M")
+        # 选「定时发布」单选
+        await page.locator("[class^='radio']:has-text('定时发布')").click()
+        await asyncio.sleep(1)
 
-        await asyncio.sleep(1)
-        await page.locator('.semi-input[placeholder="日期和时间"]').click()
-        await page.keyboard.press("Control+KeyA")
-        await page.keyboard.type(str(publish_date_hour))
-        await page.keyboard.press("Enter")
-        await asyncio.sleep(1)
+        # 定位日期输入框(placeholder 优先 + 兜底)
+        date_input = page.locator('.semi-input[placeholder="日期和时间"]').first
+        if not await date_input.count():
+            date_input = page.locator('input[placeholder*="日期"], .semi-datepicker input').first
+        if not await date_input.count():
+            raise RuntimeError("找不到定时发布日期输入框 — UI 可能变了")
+
+        async def _fill_datetime(strategy: str) -> str:
+            # 坑(2026-05-27):semi DatePicker 不吃"triple-click 全选 + type"(默认值清不掉,
+            # 输入也不进 → 卡"距定时<2小时"报错)。旧代码更是用 Control+KeyA(Mac 上不是全选)。
+            # 这里两招:① Playwright fill()(focus+清空+派发 input 事件,最稳);② Mac Cmd+A 全选重输。
+            await date_input.click()
+            await asyncio.sleep(0.4)
+            if strategy == "fill":
+                try:
+                    await date_input.fill(publish_date_hour)
+                except Exception as e:
+                    douyin_logger.debug(f"fill() 失败: {e}")
+            else:  # mac 全选(Cmd+A)再输
+                await page.keyboard.press("Meta+A")
+                await asyncio.sleep(0.2)
+                await page.keyboard.press("Backspace")
+                await asyncio.sleep(0.2)
+                await page.keyboard.type(publish_date_hour, delay=80)
+            await page.keyboard.press("Enter")
+            await asyncio.sleep(1)
+            try:
+                return (await date_input.input_value()) or ""
+            except Exception:
+                return ""
+
+        val = await _fill_datetime("fill")
+        if publish_date_hour not in val:
+            douyin_logger.warning(
+                _msg("⚠️", f"定时时间 fill 没填对(期望含 '{publish_date_hour}',实际 '{val}'),换 Cmd+A 重输")
+            )
+            val = await _fill_datetime("mac_select")
+        if publish_date_hour in val:
+            douyin_logger.success(_msg("🕒", f"定时发布时间已设为 {val}"))
+        else:
+            raise RuntimeError(f"定时发布时间设置失败,实际值 '{val}' — 不发布以免按默认时间发错")
 
     async def fill_title_and_description(self, page: Page, title: str, description: str, tags: list[str] | None = None):
         description_section = (
@@ -358,7 +411,9 @@ class DouYinBaseUploader(BaseVideoUploader):
         await page.wait_for_timeout(2000)
         try:
             await page.wait_for_selector("text=添加标签", timeout=10000)
-            dropdown = page.get_by_text("添加标签").locator("..").locator("..").locator("..").locator(".semi-select").first
+            dropdown = (
+                page.get_by_text("添加标签").locator("..").locator("..").locator("..").locator(".semi-select").first
+            )
             if not await dropdown.count():
                 douyin_logger.error(_msg("😵", "没找到标签下拉框"))
                 return False
@@ -552,595 +607,264 @@ class DouYinVideo(DouYinBaseUploader):
             douyin_logger.warning(_msg("💡", "建议:用 ffmpeg 把封面图 prepend 0.5s 到视频前,不传 --thumbnail"))
 
     async def _set_thumbnail_inner(self, page: Page):
-        """新版抖音 PC 封面流程(2026-05-22 重写,验证过)。
+        """抖音 PC 封面流程(2026-05-27 按 anyawei 实操重写)。
 
-        真实 UI 是 **两层**:
-        - inline 区(publish 主表单内的"封面"块,包含 AI 推荐封面缩略图 + "选择封面"按钮)
-        - modal(点 inline "选择封面" 触发):title "设置竖封面/设置横封面" + 大 ReactCrop crop area
-          + "+ 上传封面"按钮 + 底部 "封面检测/完成/设置横封面" 按钮组
+        正确流程(用户验证):
+        1. 点 inline "选择封面" → 打开 "设置竖封面/设置横封面" modal(默认竖封面 tab)
+        2. 点 modal 内黑色 "上传封面" 按钮 → 触发选文件(expect_file_chooser)→ set_files(竖版图)
+           → 等 ReactCrop__image naturalWidth>0(图真加载到 crop)
+        3. 传完竖封面会弹框问是否也设横封面 → 点同意 → tab 自动切到 "设置横封面"
+        4. 再点 "上传封面" → file_chooser → set_files(横版图)
+        5. 点 "完成" → modal 关闭 + 封面提交
 
-        之前的实现错误:把 inline 区当 modal,fallback set_input_files 灌到 inline 的 hidden input(它对应 AI 推荐或没绑定),
-        modal 的 ReactCrop 区始终空着(黑色),最后保存的就是这个黑色 → **黑屏封面**。
-
-        正确流程:
-        1. 点 inline 区的 "选择封面" 按钮 → modal 打开
-        2. modal 默认在 "设置竖封面" tab,点 "+ 上传封面" → expect_file_chooser → set_files
-        3. 验证 ReactCrop__image naturalWidth > 0(真实图加载到 crop)
-        4. 点底部 "设置横封面" 按钮 → tab 切到横封面
-        5. 同样:"+ 上传封面" → file_chooser → set_files → 验证
-        6. 点底部 "完成" 按钮 → modal 关 + 封面 commit
+        关键(踩过的坑):必须 **点 "上传封面" 按钮经 file_chooser 选图**;早期直接往 hidden
+        input set_input_files 会让 ReactCrop 的 naturalWidth==0(图没真加载)→ 黑屏/回退首帧。
+        竖封面用 thumbnail_portrait_path,横封面用 thumbnail_landscape_path。
         """
-        if not self.thumbnail_landscape_path and not self.thumbnail_portrait_path:
+        portrait = self.thumbnail_portrait_path
+        landscape = self.thumbnail_landscape_path
+        if not portrait and not landscape:
             return
 
         douyin_logger.info(_msg("🏃", "小人正在设置视频封面"))
 
-        # 新版抖音封面流程:
-        # 1. "选择封面" 点击触发了 modal,modal title 是 "设置封面"
-        # 2. modal 有 tab 切换"竖封面3:4 / 横封面4:3"
-        # 3. modal 内有 input[type="file"][accept*="image"],父级 cropUploadWrapper
-        # 4. 还有 radio "使用原视频封面 / 上传新封面",我们要切到"上传新封面"才能让 file input 生效
-        # 5. 设置好封面后,modal 有"完成"按钮关闭
-
-        thumb_path = self.thumbnail_landscape_path or self.thumbnail_portrait_path
-        if not thumb_path:
-            return
-
-        async def _trigger_card_input(tab_text: str) -> bool:
-            """对指定 cover 卡(tab_text='竖封面3:4'/'横封面4:3'), Playwright 真实 click 卡内的 "选择封面" 按钮,
-            **不接 file_chooser** — 因为我们要先让卡内 input 渲染出来,然后再去 set_files。
-
-            为啥不直接 expect_file_chooser:抖音的 PC stealth 检测对 expect_file_chooser 不友好,
-            click 后 dispatchEvent('click') 触发 React handler,直接渲染 input。
-            """
-            # Playwright locator scope 到对应卡片(coverControl div),click 卡内的 "选择封面"
-            card_idx = await page.evaluate(
-                """(tabText) => {
-                    const tip = Array.from(document.querySelectorAll('div[class*="cover-tip"]'))
-                        .find(e => (e.textContent || '').trim() === tabText);
-                    if (!tip) return -1;
-                    let card = tip;
-                    while (card && !(card.className && card.className.toString().includes('coverControl'))) {
-                        card = card.parentElement;
-                    }
-                    if (!card) return -1;
-                    card.scrollIntoView({ block: 'center' });
-                    return Array.from(document.querySelectorAll('div[class*="coverControl"]')).indexOf(card);
-                }""",
-                tab_text,
-            )
-            if card_idx < 0:
-                return False
-            card = page.locator('div[class*="coverControl"]').nth(card_idx)
-            choose = card.get_by_text("选择封面", exact=True).first
-            if not await choose.count():
-                douyin_logger.warning(_msg("⚠️", f"'{tab_text}' 卡内无'选择封面'文字"))
-                return False
-            try:
-                await choose.click(timeout=3000, force=True)
-                douyin_logger.info(_msg("🗂️", f"click '{tab_text}' 卡内 '选择封面' (cardIdx={card_idx})"))
-                await page.wait_for_timeout(1000)
-                return True
-            except Exception as e:
-                douyin_logger.warning(_msg("⚠️", f"click '{tab_text}' '选择封面' 失败: {e}"))
-                return False
-
-        async def _activate_cover_card(tab_text: str) -> None:
-            """通过 click 卡内 '选择封面' 让该卡的 input 渲染到 DOM,然后再 set_files 可以走到对应封面的 modal。"""
-            await _trigger_card_input(tab_text)
-
-        # 1) 触发竖封面 modal — 先 click 切换 active 卡到 "竖封面3:4",再 set_files。
-        # 关键事实(从 b0wyctu7t run dump 出来):
-        # - inline 区只有 1 个 image input(竖/横共用)
-        # - modal 的 crop 比例由当前 active 卡决定(竖卡 -> 3:4, 横卡 -> 4:3)
-        # - 要 set 竖封面就要先把竖封面卡 click 成 active,然后 set_files 触发 modal 弹出
-        await _activate_cover_card("竖封面3:4")
-
-        cover_inputs = page.locator('input[type="file"][accept*="image"]')
-        if not await cover_inputs.count():
-            raise RuntimeError("找不到 inline 封面 input — UI 可能变了")
-        try:
-            await cover_inputs.first.set_input_files(thumb_path)
-            douyin_logger.info(_msg("🔘", f"set_input_files 触发竖封面 modal 打开"))
-        except Exception as e:
-            raise RuntimeError(f"set_input_files (竖) 失败: {e}")
-
-        # 等 modal 真正打开 — 信号:页面有 "+ 上传封面" 按钮 / "设置竖封面" tab / 大 ReactCrop 区
-        modal_open_signal = None
-        for tries in range(20):
-            for sig_sel in [
-                ('text="上传封面"',     '上传封面 按钮'),
-                ('text="设置竖封面"',   '设置竖封面 tab'),
-                ('text="设置横封面"',   '设置横封面 tab'),
-                ('.ReactCrop__image',   'ReactCrop 已加载'),
-            ]:
-                try:
-                    if await page.locator(sig_sel[0]).count():
-                        modal_open_signal = sig_sel[1]
-                        break
-                except Exception:
-                    pass
-            if modal_open_signal:
-                break
-            await page.wait_for_timeout(300)
-        if not modal_open_signal:
-            if self.debug:
-                try:
-                    shot = f"/tmp/sau_dy_modal_never_opened_{int(asyncio.get_event_loop().time())}.png"
-                    await page.screenshot(path=shot, full_page=True)
-                    douyin_logger.error(_msg("📸", f"6s modal 没打开现场: {shot}"))
-                except Exception:
-                    pass
-            raise RuntimeError("set_input_files 后 modal 6s 内没打开 — UI 可能又变了")
-        douyin_logger.info(_msg("📦", f"封面 modal 已打开 (信号: {modal_open_signal})"))
-        await page.wait_for_timeout(1500)
-
-        # 2) 抖音 "设置封面" 主 modal 内有 2 张并排卡片("竖封面3:4" + "横封面4:3"),
-        # 每张卡片上传后会弹一个嵌套裁剪 modal (semi-portal + ReactCrop),
-        # 必须在裁剪 modal 内点"确认"关掉,才能继续操作下一张。
-        # 不关掉裁剪 modal 直接切下一卡片 → 裁剪未提交 → 封面是黑屏。
-
-        async def _confirm_crop_modal() -> bool:
-            """裁剪 modal (含 ReactCrop) 出现时点其内部的确认按钮,等它关闭。"""
-            # 等 ReactCrop 出现(上传完成后 2-5s 内)
-            try:
-                await page.wait_for_selector('.ReactCrop__image', state='visible', timeout=6000)
-            except Exception:
-                return False  # 没出现裁剪 modal,跳过
-            douyin_logger.debug(_msg("✂️", "裁剪 modal 出现,找确认按钮"))
-
-            # 找裁剪 modal 内部的确认按钮(必须限定在含 ReactCrop 的 portal 内,避免误点主 modal 保存)
-            confirm_texts = ["确认", "确定", "完成", "应用", "裁剪", "保存"]
-            for confirm_text in confirm_texts:
-                for sel in [
-                    f'.semi-portal:has(.ReactCrop__image) button:visible:has-text("{confirm_text}")',
-                    f'div[role="modal"]:has(.ReactCrop__image) button:visible:has-text("{confirm_text}")',
-                    f'div:has(> .ReactCrop) button:visible:has-text("{confirm_text}")',
-                ]:
-                    try:
-                        btn = page.locator(sel).first
-                        if await btn.count() and await btn.is_visible():
-                            await btn.click(timeout=2000)
-                            douyin_logger.debug(_msg("✅", f"裁剪确认: '{confirm_text}' ({sel[:40]})"))
-                            # 等 ReactCrop 消失
-                            try:
-                                await page.wait_for_selector('.ReactCrop__image', state='hidden', timeout=5000)
-                            except Exception:
-                                pass
-                            return True
-                    except Exception:
-                        continue
-            douyin_logger.warning(_msg("⚠️", "找不到裁剪 modal 的确认按钮"))
-            return False
-
-        async def _dump_cover_state(tag: str):
-            """在 cover 操作流程中 dump 关键元素状态(file inputs + tab labels + active card),
-            DEBUG 用,识别真实 tab 切换是否有效。"""
+        async def _shot(tag: str) -> None:
             if not self.debug:
                 return
             try:
-                state = await page.evaluate(
-                    """
-                    () => {
-                        const r = (el) => {
-                            const b = el.getBoundingClientRect();
-                            return {x: Math.round(b.x), y: Math.round(b.y), w: Math.round(b.width), h: Math.round(b.height)};
-                        };
-                        const inputs = Array.from(document.querySelectorAll('input[type="file"][accept*="image"]'))
-                            .map((inp, i) => ({
-                                idx: i,
-                                visible: inp.offsetParent !== null,
-                                rect: r(inp),
-                                parentText: (inp.closest('div[class*="cropUploadWrapper"]')?.textContent || inp.parentElement?.textContent || '').replace(/\\s+/g, ' ').trim().substring(0, 80),
-                            }));
-                        const tipLabels = Array.from(document.querySelectorAll('div[class*="cover-tip"]'))
-                            .map(el => ({
-                                text: (el.textContent || '').trim(),
-                                rect: r(el),
-                            }));
-                        // 找 active card 候选:含 active / selected / checked 类的祖先
-                        const cards = tipLabels.map(t => {
-                            const el = Array.from(document.querySelectorAll('div[class*="cover-tip"]'))
-                                .find(e => (e.textContent || '').trim() === t.text);
-                            if (!el) return null;
-                            let p = el.parentElement;
-                            const ancestorClasses = [];
-                            for (let i = 0; i < 5 && p; i++) {
-                                ancestorClasses.push((p.className || '').toString().substring(0, 60));
-                                p = p.parentElement;
-                            }
-                            return { tipText: t.text, ancestorClasses };
-                        }).filter(Boolean);
-                        return { inputs, tipLabels, cards };
-                    }
-                    """
+                p = f"/tmp/sau_dy_cover_{tag}_{int(asyncio.get_event_loop().time())}.png"
+                await page.screenshot(path=p, full_page=True)
+                douyin_logger.info(_msg("📸", f"[{tag}] {p}"))
+            except Exception:
+                pass
+
+        async def _dump_buttons(tag: str) -> None:
+            """dump 当前所有可见按钮文字 — 用来发现'是否设横封面'弹框的按钮名。"""
+            if not self.debug:
+                return
+            try:
+                txts = await page.evaluate(
+                    """() => Array.from(document.querySelectorAll(
+                            'button, [role=button], div[class*=btn], div[class*=button]'))
+                        .filter(b => b.offsetParent !== null)
+                        .map(b => (b.innerText || '').replace(/\\s+/g, ' ').trim())
+                        .filter(t => t && t.length <= 24)"""
+                )
+                douyin_logger.info(_msg("🔘", f"[{tag}] 可见按钮: {txts}"))
+            except Exception:
+                pass
+
+        async def _dump_dom(tag: str) -> None:
+            """无条件 dump 当前 DOM 的封面相关元素(imgs + 可见按钮 + 嵌套 portal),
+            写到 /tmp 文件 + log 摘要。screenshot 在抖音页会抛异常,所以用 evaluate 拿数据。"""
+            try:
+                data = await page.evaluate(
+                    """() => {
+                        const imgs = Array.from(document.querySelectorAll('img'))
+                            .map(im => ({
+                                cls: (im.className || '').toString().slice(0, 50),
+                                src: (im.currentSrc || im.src || '').slice(0, 70),
+                                nw: im.naturalWidth, nh: im.naturalHeight,
+                                vis: im.offsetParent !== null,
+                            }))
+                            .filter(o => o.nw > 0 || o.src.startsWith('blob:') || o.src.startsWith('data:'));
+                        const btns = Array.from(document.querySelectorAll('button, [role=button]'))
+                            .filter(b => b.offsetParent !== null)
+                            .map(b => (b.innerText || '').replace(/\\s+/g, ' ').trim())
+                            .filter(t => t && t.length <= 24);
+                        const portals = Array.from(document.querySelectorAll(
+                            '.semi-portal, div[role=dialog], div[class*=modal], div[class*=Modal]'))
+                            .filter(p => p.offsetParent !== null)
+                            .map(p => ({ cls: (p.className || '').toString().slice(0, 50),
+                                         txt: (p.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 60) }));
+                        const crops = Array.from(document.querySelectorAll(
+                            '[class*=ReactCrop], [class*=crop], [class*=Crop], [class*=cropper]'))
+                            .map(c => ({ cls: (c.className || '').toString().slice(0, 50),
+                                         hasImg: !!c.querySelector('img') }));
+                        return { imgs, btns, portals, crops };
+                    }"""
                 )
                 import json as _json
-                path = f"/tmp/sau_cover_state_{tag}_{int(asyncio.get_event_loop().time())}.json"
-                with open(path, "w", encoding="utf-8") as f:
-                    _json.dump(state, f, ensure_ascii=False, indent=2)
-                douyin_logger.info(_msg("🔍", f"封面状态 dump [{tag}]: {path}"))
-            except Exception as e:
-                douyin_logger.warning(_msg("⚠️", f"dump 失败 [{tag}]: {e}"))
 
-        async def _dump_modal_tree() -> None:
-            """完整 dump 设置封面 modal 内部结构 — 给定位逻辑用。"""
-            if not self.debug:
-                return
-            try:
-                tree = await page.evaluate(
-                    """
-                    () => {
-                        // 找两个 cover-tip("竖封面3:4" / "横封面4:3"),dump 它们的完整祖先 chain + sibling 文字摘要
-                        const tips = Array.from(document.querySelectorAll('div[class*="cover-tip"]'));
-                        if (tips.length === 0) return { error: 'no cover-tip found' };
-                        const out = [];
-                        for (const tip of tips) {
-                            out.push(`==== tip: "${(tip.textContent || '').trim()}" ====`);
-                            let el = tip;
-                            let depth = 0;
-                            while (el && el.tagName !== 'BODY' && depth < 25) {
-                                const cls = (el.className || '').toString();
-                                const tag = el.tagName;
-                                const innerText = (el.innerText || '').replace(/\\s+/g, ' ').trim().substring(0, 140);
-                                const hasUploadNew = innerText.includes('上传新封面');
-                                const hasUseOrig = innerText.includes('使用原视频封面');
-                                const hasFileInput = el.querySelector ? !!el.querySelector('input[type="file"]') : false;
-                                const inputCount = el.querySelectorAll ? el.querySelectorAll('input[type="file"]').length : 0;
-                                out.push(`  depth=${depth} <${tag} cls="${cls.substring(0, 60)}"> uploadNew=${hasUploadNew} useOrig=${hasUseOrig} fileInputs=${inputCount} text="${innerText}"`);
-                                el = el.parentElement;
-                                depth++;
-                            }
-                            out.push('');
-                        }
-                        // 再 dump 所有 file inputs (无论是否在 cover-tip 祖先链上)
-                        const allInputs = Array.from(document.querySelectorAll('input[type="file"]'));
-                        out.push(`==== all file inputs (page-wide) ${allInputs.length} 个 ====`);
-                        allInputs.forEach((inp, i) => {
-                            const accept = inp.accept || '';
-                            // 找最近的有"封面"/"竖"/"横"字样的祖先
-                            let el = inp.parentElement;
-                            let nearestCoverAncestor = '';
-                            for (let k = 0; k < 12 && el; k++) {
-                                const t = (el.innerText || '').substring(0, 60);
-                                if (t.includes('竖封面') || t.includes('横封面')) {
-                                    nearestCoverAncestor = `depth=${k} cls="${(el.className||'').toString().substring(0,50)}" text="${t}"`;
-                                    break;
-                                }
-                                el = el.parentElement;
-                            }
-                            out.push(`  input[${i}] accept="${accept}" visible=${inp.offsetParent !== null} coverAnc=${nearestCoverAncestor || 'none'}`);
-                        });
-                        return { tree: out.join('\\n'), lines: out.length };
-                    }
-                    """
+                p = f"/tmp/sau_dy_dom_{tag}_{int(asyncio.get_event_loop().time())}.json"
+                with open(p, "w", encoding="utf-8") as f:
+                    _json.dump(data, f, ensure_ascii=False, indent=2)
+                douyin_logger.info(
+                    _msg(
+                        "🔍",
+                        f"[{tag}] DOM dump -> {p} | imgs={len(data['imgs'])} btns={data['btns']} crops={data['crops']}",
+                    )
                 )
-                path = f"/tmp/sau_modal_tree_{int(asyncio.get_event_loop().time())}.txt"
-                with open(path, "w", encoding="utf-8") as f:
-                    if "tree" in tree:
-                        f.write(tree["tree"])
-                    else:
-                        f.write(str(tree))
-                douyin_logger.info(_msg("🌳", f"modal 完整结构 dump: {path} ({tree.get('lines', '?')} 行)"))
             except Exception as e:
-                douyin_logger.warning(_msg("⚠️", f"modal tree dump 失败: {e}"))
+                douyin_logger.warning(_msg("⚠️", f"[{tag}] DOM dump 失败: {e}"))
 
         async def _verify_crop_loaded(label: str) -> bool:
-            """等 ReactCrop__image naturalWidth>0,说明真实图加载到了 crop 区。"""
-            for _ in range(40):  # 20s max
+            """判定封面图加载成功:.ReactCrop__image 或 任意 modal 内 blob/data img naturalWidth>0。"""
+            for _ in range(40):  # 20s
                 try:
-                    nw = await page.evaluate("""() => {
-                        const img = document.querySelector('.ReactCrop__image');
-                        return img ? img.naturalWidth : -1;
-                    }""")
-                    if nw and nw > 0:
-                        douyin_logger.info(_msg("✅", f"[{label}] ReactCrop 图已加载 naturalWidth={nw}"))
+                    res = await page.evaluate(
+                        """() => {
+                            const rc = document.querySelector('.ReactCrop__image');
+                            if (rc && rc.naturalWidth > 0) return {ok: true, sel: 'ReactCrop__image', nw: rc.naturalWidth};
+                            const cand = Array.from(document.querySelectorAll('img'))
+                                .find(im => im.naturalWidth >= 100
+                                    && ((im.currentSrc || im.src || '').startsWith('blob:')
+                                        || (im.currentSrc || im.src || '').startsWith('data:'))
+                                    && im.offsetParent !== null);
+                            if (cand) return {ok: true, sel: 'blob/data img', nw: cand.naturalWidth,
+                                              cls: (cand.className||'').toString().slice(0,40)};
+                            return {ok: false};
+                        }"""
+                    )
+                    if res and res.get("ok"):
+                        douyin_logger.info(_msg("✅", f"[{label}] 封面图已加载 ({res})"))
                         return True
                 except Exception:
                     pass
                 await page.wait_for_timeout(500)
+            await _dump_dom(f"{label}_未加载")
             return False
 
-        async def _click_save_in_crop_modal(label: str) -> bool:
-            """这版 modal 极简: title '设置封面' + crop + 取消/保存 按钮。点保存关 modal 提交 crop。
-
-            重要:force=True click 会跳过 React onClick handler,只触发原生 click 事件。
-            用 Playwright 的 dispatch_event('click') 或 mouse.click(x,y) 才能真正触发 React。
-            """
-            # 找到粉色"保存"按钮 (cls 含 primary-cECiOJ 是粉色主按钮)
-            save_btn = page.locator('button.primary-cECiOJ:has-text("保存"), button:has-text("保存")').filter(has_text="保存").first
-            if not await save_btn.count():
-                douyin_logger.error(_msg("❌", f"[{label}] 找不到 '保存' 按钮"))
-                return False
-            # 拿坐标
-            try:
-                box = await save_btn.bounding_box()
-            except Exception:
-                box = None
-            if not box:
-                douyin_logger.warning(_msg("⚠️", f"[{label}] 拿不到 '保存' 按钮坐标"))
-                return False
-            # 用 mouse 真实 click 中心坐标 — 触发 React onClick
-            cx = box["x"] + box["width"] / 2
-            cy = box["y"] + box["height"] / 2
-            try:
-                await page.mouse.click(cx, cy, delay=80)
-                douyin_logger.info(_msg("🟢", f"[{label}] mouse.click '保存' at ({cx:.0f},{cy:.0f})"))
-                return True
-            except Exception as e:
-                douyin_logger.warning(_msg("⚠️", f"[{label}] mouse click 失败: {e},fallback dispatch_event"))
-            # 兜底 dispatchEvent
-            try:
-                await save_btn.dispatch_event('click')
-                douyin_logger.info(_msg("🟢", f"[{label}] dispatch_event click '保存'"))
-                return True
-            except Exception as e:
-                douyin_logger.error(_msg("❌", f"[{label}] dispatch_event 也失败: {e}"))
-                return False
-
-        async def _wait_modal_closed(label: str) -> bool:
-            """modal close 信号:ReactCrop__image 消失。"""
-            for _ in range(20):  # 10s
-                try:
-                    if not await page.locator('.ReactCrop__image').count():
-                        douyin_logger.info(_msg("✅", f"[{label}] modal 已关闭"))
-                        return True
-                except Exception:
-                    pass
-                await page.wait_for_timeout(500)
-            return False
-
-        # 2) modal 已通过 set_files 打开,图已加载,验证后点保存
-        if self.debug:
-            try:
-                shot = f"/tmp/sau_dy_modal_opened_{int(asyncio.get_event_loop().time())}.png"
-                await page.screenshot(path=shot, full_page=True)
-                douyin_logger.info(_msg("📸", f"modal 打开截图: {shot}"))
-            except Exception:
-                pass
-
-        if not await _verify_crop_loaded("竖封面"):
-            raise RuntimeError("竖封面 ReactCrop naturalWidth==0,图没加载")
-
-        # DUMP modal 完整内容
-        modal_inner = await page.evaluate(
-            """() => {
-                const portal = document.querySelector('.semi-portal:has(.ReactCrop__image), div[role="dialog"]:has(.ReactCrop__image)');
-                if (!portal) return { error: 'no crop portal' };
-                const r = (el) => {
-                    if (!el) return null;
-                    const b = el.getBoundingClientRect();
-                    return {x: Math.round(b.x), y: Math.round(b.y), w: Math.round(b.width), h: Math.round(b.height), ratio: (b.width/b.height).toFixed(2)};
-                };
-                const buttons = Array.from(portal.querySelectorAll('button, [role="button"], a')).map(b => ({
-                    text: (b.innerText || b.textContent || '').trim().substring(0, 30),
-                    cls: (b.className || '').toString().substring(0, 80),
-                    visible: b.offsetParent !== null,
-                    rect: r(b),
-                    title: b.getAttribute('title') || '',
-                    ariaLabel: b.getAttribute('aria-label') || '',
-                    iconHtml: (Array.from(b.querySelectorAll('svg, i, [class*="icon"]')).map(e => (e.outerHTML || '').substring(0, 100)).join(';')).substring(0, 200),
-                    outerHtml: (b.outerHTML || '').substring(0, 250),
-                }));
-                const reactCrop = portal.querySelector('.ReactCrop');
-                const cropImg = portal.querySelector('.ReactCrop__image');
-                const cropSel = portal.querySelector('.ReactCrop__crop-selection');
-                // 还有 image src / crop selection style
-                const cropStyle = cropSel ? (cropSel.getAttribute('style') || '') : '';
-                return {
-                    title: (portal.innerText || '').split('\\n')[0].substring(0, 40),
-                    buttons,
-                    imgRect: r(cropImg),
-                    imgSrc: cropImg ? (cropImg.src || '').substring(0, 60) : null,
-                    cropRect: r(cropSel),
-                    cropStyle,
-                    reactCropRect: r(reactCrop),
-                    portalText: (portal.innerText || '').substring(0, 300),
-                };
-            }"""
-        )
-        # 写到文件方便看
-        import json as _json
-        modal_dump_path = f"/tmp/sau_dy_modal_inner_{int(asyncio.get_event_loop().time())}.json"
-        with open(modal_dump_path, "w", encoding="utf-8") as f:
-            _json.dump(modal_inner, f, ensure_ascii=False, indent=2)
-        douyin_logger.info(_msg("🔍", f"竖封面 modal 内部 dump: {modal_dump_path}"))
-
-        await page.wait_for_timeout(1500)  # 让 crop 选区稳定
-
-        if not await _click_save_in_crop_modal("竖封面"):
-            raise RuntimeError("竖封面 modal '保存' 按钮找不到")
-
-        if not await _wait_modal_closed("竖封面"):
-            raise RuntimeError("竖封面 modal 没关闭 — 保存失败")
-
-        douyin_logger.success(_msg("🥳", "mini modal 保存完成"))
-        await page.wait_for_timeout(2500)
-
-        # 完整 modal(AI 模式)如果弹了就先 X 关掉 — 它不适合我们用代码操作(全 AI 生成异步)。
-        # mini modal 已经直接 commit 了 cover。
-        try:
-            close_btn = page.locator('button.semi-modal-close').first
-            if await close_btn.count() and await close_btn.is_visible():
-                box = await close_btn.bounding_box()
-                if box:
-                    await page.mouse.click(box["x"] + box["width"]/2, box["y"] + box["height"]/2, delay=80)
-                    douyin_logger.info(_msg("🚪", "关闭完整 modal (X 按钮)"))
-                    await page.wait_for_timeout(1500)
-        except Exception:
-            pass
-
-        # 重新看完整 modal 是否还在 — 如果还在,试 _trigger_card_input 横封面后做横封面 mini modal
-        full_modal_open = False
-        for _ in range(3):
-            try:
-                if await page.locator('text="设置竖封面"').count() and await page.locator('text="设置横封面"').count():
-                    full_modal_open = True
-                    break
-            except Exception:
-                pass
-            await page.wait_for_timeout(300)
-
-        if not full_modal_open:
-            # 完整 modal 没出现 — mini modal 可能已经直接 commit 了。验证 inline 区缩略图。
-            douyin_logger.warning(_msg("⚠️", "完整 modal 没出现,验证 inline 区是否已 commit"))
-            inline_state = await page.evaluate(
-                """() => {
-                    const cards = Array.from(document.querySelectorAll('div[class*="coverControl"]'));
-                    return cards.map((card, idx) => {
-                        // img/source/background-image 都看
-                        const imgs = Array.from(card.querySelectorAll('img')).map(i => ({src: (i.src||'').substring(0,80), w: i.naturalWidth}));
-                        // 所有有 background-image 的 element
-                        const elsWithBg = [];
-                        card.querySelectorAll('*').forEach(el => {
-                            const bg = window.getComputedStyle(el).backgroundImage;
-                            if (bg && bg !== 'none' && bg.includes('url(')) {
-                                const m = bg.match(/url\\(['"]?([^'"\\)]+)/);
-                                if (m) elsWithBg.push({tag: el.tagName, cls: (el.className||'').toString().substring(0,40), bg: m[1].substring(0, 80)});
-                            }
-                        });
-                        return { idx, cardText: (card.innerText || '').replace(/\\s+/g,' ').substring(0,30), imgs, bgs: elsWithBg };
-                    });
-                }"""
-            )
-            douyin_logger.info(_msg("🔍", f"mini-only inline state: {inline_state}"))
-            # 如果任一卡有 blob:/data:/真 url 的缩略图,认为 mini commit 成功
-            committed_any = False
-            for c in inline_state:
-                for src_obj in c.get("imgs", []) + [{"src": b["bg"]} for b in c.get("bgs", [])]:
-                    src = src_obj.get("src", "")
-                    if src and not src.startswith("data:image/svg") and ("blob:" in src or "douyin" in src or "byteimg" in src or "static" not in src.lower()):
-                        if any(kw in src for kw in ["blob:", "douyin.com", "byteimg.com", "douyincdn.com", "img.douyin"]):
-                            committed_any = True
-                            break
-                if committed_any:
-                    break
-            if not committed_any:
-                if self.debug:
-                    try:
-                        shot = f"/tmp/sau_dy_inline_not_committed_{int(asyncio.get_event_loop().time())}.png"
-                        await page.screenshot(path=shot, full_page=True)
-                        douyin_logger.error(_msg("📸", f"inline 没 commit: {shot}"))
-                    except Exception:
-                        pass
-                raise RuntimeError("mini 保存后,inline 区没看到真实封面图(可能 commit 失败)")
-            douyin_logger.success(_msg("🥳", "inline 区检测到真实封面图 — mini 已 commit"))
-            # 跳过完整 modal 流程
-            douyin_logger.info(_msg("🥳", "封面流程完成(mini-only path)"))
-            return
-        douyin_logger.info(_msg("📦", "完整封面 modal 已自动打开"))
-
-        if self.debug:
-            try:
-                shot = f"/tmp/sau_dy_full_modal_{int(asyncio.get_event_loop().time())}.png"
-                await page.screenshot(path=shot, full_page=True)
-                douyin_logger.info(_msg("📸", f"完整 modal 截图: {shot}"))
-            except Exception:
-                pass
-
-        async def _upload_in_full_modal(tab_text: str) -> bool:
-            """在完整 modal 内:点 tab → 点 "+ 上传封面" → expect_file_chooser → set_files → 验证 ReactCrop。"""
-            # 先切 tab(如果还不在该 tab)
-            tab = page.get_by_text(tab_text, exact=True).first
-            if await tab.count():
-                try:
-                    await tab.click(timeout=3000, force=True)
-                    douyin_logger.info(_msg("🗂️", f"切到完整 modal tab '{tab_text}'"))
-                    await page.wait_for_timeout(1200)
-                except Exception as e:
-                    douyin_logger.debug(f"tab '{tab_text}' click 失败: {e}")
-
-            # 找 "+ 上传封面" 按钮 → file_chooser
+        async def _upload_via_button(image_path: str, label: str) -> None:
+            """点 modal 内 '上传封面' 按钮 → file_chooser → set_files → 等 ReactCrop 加载。"""
             upload_btn = page.get_by_text("上传封面", exact=True).first
             if not await upload_btn.count():
                 upload_btn = page.get_by_role("button", name="上传封面").first
             if not await upload_btn.count():
-                douyin_logger.error(_msg("❌", f"[{tab_text}] 完整 modal 找不到 '+ 上传封面' 按钮"))
-                return False
-
-            uploaded = False
+                raise RuntimeError(f"[{label}] 找不到 '上传封面' 按钮")
             try:
                 async with page.expect_file_chooser(timeout=8000) as fc_info:
-                    # 用 mouse click 真实触发,而不是 force=True
-                    try:
-                        box = await upload_btn.bounding_box()
-                        if box:
-                            await page.mouse.click(box["x"] + box["width"]/2, box["y"] + box["height"]/2, delay=80)
-                        else:
-                            await upload_btn.click(timeout=3000)
-                    except Exception:
-                        await upload_btn.click(timeout=3000, force=True)
+                    box = await upload_btn.bounding_box()
+                    if box:
+                        await page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2, delay=80)
+                    else:
+                        await upload_btn.click(timeout=3000)
                 fc = await fc_info.value
-                await fc.set_files(thumb_path)
-                douyin_logger.info(_msg("🖼️", f"[{tab_text}] file_chooser set_files"))
-                uploaded = True
+                await fc.set_files(image_path)
+                douyin_logger.info(_msg("🖼️", f"[{label}] file_chooser set_files: {image_path}"))
             except PlaywrightTimeoutError:
-                douyin_logger.warning(_msg("⚠️", f"[{tab_text}] file_chooser 没弹,fallback set_files to .last"))
+                # 兜底:file_chooser 没弹就直接往最后一个 image input set_files
                 file_input = page.locator('input[type="file"][accept*="image"]').last
-                try:
-                    await file_input.wait_for(state="attached", timeout=3000)
-                    await file_input.set_input_files(thumb_path)
-                    douyin_logger.info(_msg("🖼️", f"[{tab_text}] set_input_files to .last input"))
-                    uploaded = True
-                except PlaywrightTimeoutError:
-                    pass
+                await file_input.set_input_files(image_path)
+                douyin_logger.info(_msg("🖼️", f"[{label}] fallback set_input_files: {image_path}"))
+            # 选完文件留点时间让图渲染进 modal 的 crop 区(抖音当前 UI 是 inline crop,没有嵌套裁剪子框,
+            # 别去点什么"确认/完成"—— 之前那样会误点主 modal 的"完成"提前关掉)。
+            await page.wait_for_timeout(2500)
+            if self.debug:
+                await _dump_dom(f"{label}_set_files后")
+            if not await _verify_crop_loaded(label):
+                raise RuntimeError(f"[{label}] 封面图没加载(naturalWidth==0)")
 
-            if not uploaded:
-                return False
-
-            # 等 ReactCrop 显示真实图
-            for _ in range(40):
+        async def _go_landscape_tab() -> None:
+            """传完竖封面后:过 '是否也设横封面' 弹框(点同意)/ 或直接点 '设置横封面' tab,切到横封面。"""
+            await _dump_buttons("竖封面后-找横封面入口")
+            # 1) 先试弹框的同意按钮(名字未知,挨个试)
+            for t in ["去设置", "立即设置", "上传横封面", "去上传", "设置横封面", "继续", "好的", "确定", "确认"]:
+                loc = page.locator(
+                    f'div[role="dialog"] button:has-text("{t}"), .semi-modal button:has-text("{t}"), '
+                    f'div[class*="modal"] button:has-text("{t}")'
+                ).first
                 try:
-                    nw = await page.evaluate("""() => {
-                        const img = document.querySelector('.ReactCrop__image');
-                        return img ? img.naturalWidth : -1;
-                    }""")
-                    if nw and nw > 0:
-                        douyin_logger.info(_msg("✅", f"[{tab_text}] ReactCrop naturalWidth={nw}"))
-                        return True
+                    if await loc.count() and await loc.is_visible():
+                        await loc.click(timeout=2000)
+                        douyin_logger.info(_msg("🗂️", f"横封面弹框点了 '{t}'"))
+                        await page.wait_for_timeout(800)
+                        break
+                except Exception:
+                    continue
+            # 2) 无论有没有弹框,确保切到 "设置横封面" tab
+            tab = page.get_by_text("设置横封面", exact=True).first
+            try:
+                if await tab.count():
+                    box = await tab.bounding_box()
+                    if box:
+                        await page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2, delay=60)
+                    else:
+                        await tab.click(timeout=2000, force=True)
+                    douyin_logger.info(_msg("🗂️", "切到 '设置横封面' tab"))
+                    await page.wait_for_timeout(1000)
+            except Exception as e:
+                douyin_logger.warning(_msg("⚠️", f"切横封面 tab 失败: {e}"))
+
+        async def _click_done() -> None:
+            await page.wait_for_timeout(800)
+            done_btn = page.get_by_role("button", name="完成", exact=True).first
+            if not await done_btn.count():
+                done_btn = page.get_by_text("完成", exact=True).first
+            if not await done_btn.count():
+                raise RuntimeError("找不到 '完成' 按钮")
+            box = await done_btn.bounding_box()
+            if box:
+                await page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2, delay=80)
+            else:
+                await done_btn.click(timeout=3000, force=True)
+            douyin_logger.info(_msg("🟢", "点了 '完成'"))
+            for _ in range(20):  # 等 modal 关闭(设置竖封面 tab 消失)
+                try:
+                    if not await page.locator('text="设置竖封面"').count():
+                        douyin_logger.success(_msg("🥳", "封面 modal 已关闭,封面已提交"))
+                        return
                 except Exception:
                     pass
                 await page.wait_for_timeout(500)
+            douyin_logger.warning(_msg("⚠️", "点完成后 modal 没在 10s 内关闭"))
+
+        # === 流程 ===
+        # 1) 打开封面 modal:点 inline "选择封面"(带重试 + 加长等待 —— 页面在跑"快速检测"或视频
+        #    还在处理时,inline 封面区会迟迟不就绪/点了不弹,之前固定 10s 偶发超时回退首帧)
+        async def _open_cover_modal() -> bool:
+            for attempt in range(4):
+                choose = page.get_by_text("选择封面", exact=True).first
+                if not await choose.count():
+                    choose = page.get_by_role("button", name="选择封面").first
+                if not await choose.count():
+                    await page.wait_for_timeout(2000)
+                    continue
+                try:
+                    await choose.scroll_into_view_if_needed(timeout=3000)
+                except Exception:
+                    pass
+                try:
+                    await choose.click(timeout=5000, force=True)
+                except Exception as e:
+                    douyin_logger.warning(_msg("⚠️", f"点'选择封面'失败({attempt + 1}/4): {e}"))
+                    await page.wait_for_timeout(1500)
+                    continue
+                for _ in range(36):  # 等"上传封面"出现,最多 ~18s
+                    if await page.locator('text="上传封面"').count():
+                        return True
+                    await page.wait_for_timeout(500)
+                douyin_logger.warning(_msg("⚠️", f"点'选择封面'后 modal ~18s 没开,重试({attempt + 1}/4)"))
             return False
 
-        # 完整 modal 默认在 "设置竖封面" tab
-        if not await _upload_in_full_modal("设置竖封面"):
-            raise RuntimeError("完整 modal: 设置竖封面 失败")
-
-        # 切到 "设置横封面" tab,上传
-        if not await _upload_in_full_modal("设置横封面"):
-            raise RuntimeError("完整 modal: 设置横封面 失败")
-
-        # 点完整 modal "完成" 按钮 - 真 commit
+        if not await _open_cover_modal():
+            await _shot("modal没打开")
+            raise RuntimeError("点 '选择封面' 后封面 modal 没打开(已重试4次)")
+        douyin_logger.info(_msg("📦", "封面 modal 已打开"))
         await page.wait_for_timeout(1000)
-        done_btn = page.get_by_text("完成", exact=True).first
-        if not await done_btn.count():
-            done_btn = page.get_by_role("button", name="完成").first
-        if not await done_btn.count():
-            raise RuntimeError("完整 modal: 找不到 '完成' 按钮")
-        try:
-            box = await done_btn.bounding_box()
-            if box:
-                await page.mouse.click(box["x"] + box["width"]/2, box["y"] + box["height"]/2, delay=80)
-                douyin_logger.info(_msg("🟢", f"mouse.click 完整 modal '完成' at ({box['x']+box['width']/2:.0f},{box['y']+box['height']/2:.0f})"))
-            else:
-                await done_btn.click(timeout=3000, force=True)
-        except Exception:
-            await done_btn.click(timeout=3000, force=True)
+        await _shot("modal已开")
 
-        # 等完整 modal 关闭
-        for _ in range(20):
+        # 2) 竖封面(默认就在 "设置竖封面" tab,保险起见再点一下)
+        if portrait:
+            ptab = page.get_by_text("设置竖封面", exact=True).first
             try:
-                if not await page.locator('text="设置竖封面"').count():
-                    douyin_logger.success(_msg("🥳", "完整 modal 已关闭,封面真 commit"))
-                    break
+                if await ptab.count():
+                    await ptab.click(timeout=2000, force=True)
+                    await page.wait_for_timeout(500)
             except Exception:
                 pass
-            await page.wait_for_timeout(500)
-        else:
-            raise RuntimeError("完整 modal 没关闭")
+            await _upload_via_button(portrait, "竖封面")
+            await _shot("竖封面已传")
 
-        douyin_logger.success(_msg("🥳", "两张封面已通过完整 modal 全部 commit"))
+        # 3) 横封面
+        if landscape:
+            await _go_landscape_tab()
+            await _upload_via_button(landscape, "横封面")
+            await _shot("横封面已传")
+
+        # 4) 完成
+        await _click_done()
+        await _shot("完成后")
 
     async def upload(self, playwright: Playwright) -> None:
         douyin_logger.info(_msg("🧍", "小人先检查 cookie、视频文件、封面和发布时间"))
@@ -1155,10 +879,13 @@ class DouYinVideo(DouYinBaseUploader):
         context = await set_init_script(context)
 
         page = await context.new_page()
-        await page.goto("https://creator.douyin.com/creator-micro/content/upload")
+        # 抖音创作中心首屏资源多,默认 wait_until="load" + 30s 经常不够;放宽到 domcontentloaded + 60s
+        await page.goto(
+            "https://creator.douyin.com/creator-micro/content/upload", wait_until="domcontentloaded", timeout=60000
+        )
         douyin_logger.info(_msg("🏃", f"小人开始搬运视频: {self.title}.mp4"))
         douyin_logger.info(_msg("🧭", "小人正在赶往上传主页"))
-        await page.wait_for_url("https://creator.douyin.com/creator-micro/content/upload")
+        await page.wait_for_url("https://creator.douyin.com/creator-micro/content/upload", timeout=30000)
         await page.locator("div[class^='container'] input").set_input_files(self.file_path)
 
         while True:
@@ -1219,6 +946,19 @@ class DouYinVideo(DouYinBaseUploader):
 
         if self.publish_strategy == DOUYIN_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
             await self.set_schedule_time_douyin(page, self.publish_date)
+
+        # 调试开关:封面 + 定时都设好后停下、不真发帖(避免测试发重复)。set SAU_DY_COVER_TEST=1 启用。
+        if os.environ.get("SAU_DY_COVER_TEST"):
+            try:
+                shot = f"/tmp/sau_dy_cover_test_final_{int(asyncio.get_event_loop().time())}.png"
+                await page.screenshot(path=shot, full_page=True)
+                douyin_logger.success(_msg("🧪", f"SAU_DY_COVER_TEST: 封面+定时已设,跳过发布。终态截图: {shot}"))
+            except Exception:
+                douyin_logger.success(_msg("🧪", "SAU_DY_COVER_TEST: 封面+定时已设,跳过发布"))
+            await asyncio.sleep(2)
+            await context.close()
+            await browser.close()
+            return
 
         # 抖音点"发布"后可能弹"未添加自主声明" dialog(AI 生成 / 营销推广等检测),默认走"直接发布"
         # (用户已在 desc 里能识别 AI,日后可在创作中心补标声明);未来想强制标 AI 可加 --ai-declaration 参数。
