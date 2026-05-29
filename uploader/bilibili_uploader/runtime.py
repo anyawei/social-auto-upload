@@ -11,7 +11,6 @@ from pathlib import Path
 
 import requests
 
-
 GITHUB_RELEASE_API = "https://api.github.com/repos/biliup/biliup/releases/latest"
 
 
@@ -75,14 +74,17 @@ def _select_release_asset(assets: list[dict]) -> dict:
 
 
 def fetch_latest_release() -> dict:
-    response = requests.get(
-        GITHUB_RELEASE_API,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "social-auto-upload",
-        },
-        timeout=30,
-    )
+    import os
+
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "social-auto-upload",
+    }
+    # 支持 GITHUB_TOKEN(避免 60req/h/IP 限额;走 user 5000/h 配额)
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    response = requests.get(GITHUB_RELEASE_API, headers=headers, timeout=30)
     response.raise_for_status()
     payload = response.json()
     selected_asset = _select_release_asset(payload.get("assets", []))
