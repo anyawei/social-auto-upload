@@ -29,6 +29,15 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Windows 默认 cmd codepage 是 gbk,中文/emoji print 会崩 UnicodeEncodeError;
+# Mac/Linux 默认 utf-8,reconfigure 不影响。
+for _s in (sys.stdout, sys.stderr):
+    if hasattr(_s, "reconfigure") and (_s.encoding or "").lower() != "utf-8":
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError):
+            pass
+
 REPO = Path(__file__).resolve().parent.parent
 SAU_CLI = REPO / "sau_cli.py"
 sys.path.insert(0, str(REPO))
